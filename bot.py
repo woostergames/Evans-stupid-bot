@@ -9,6 +9,8 @@ import threading
 from pathlib import Path
 from dotenv import load_dotenv
 from http.server import HTTPServer, BaseHTTPRequestHandler
+import static_ffmpeg
+static_ffmpeg.add_paths()
 
 load_dotenv()
 
