@@ -1,6 +1,4 @@
 https://github.com/yt-dlp/yt-dlp/archive/refs/heads/master.zip
-bgutil-ytdlp-pot-provider
-yt-dlp-get-pot
 discord.py
 python-dotenv
 static-ffmpeg
