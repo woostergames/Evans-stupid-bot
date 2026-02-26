@@ -1,4 +1,3 @@
-https://github.com/yt-dlp/yt-dlp/archive/refs/heads/master.zip
 discord.py
+aiohttp
 python-dotenv
-static-ffmpeg
