@@ -516,6 +516,7 @@ async def mp3(ctx, *, url: str = None):
     await status.edit(content=f"⏳ Converting **{title}** to MP3...")
 
     ydl_opts = {
+       'cookiefile': 'cookies.txt',
         "format": "bestaudio/best",
         "outtmpl": os.path.join(DOWNLOADS_DIR, f"{safe_name}.%(ext)s"),
         "postprocessors": [{
