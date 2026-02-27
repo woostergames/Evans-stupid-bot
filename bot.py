@@ -82,14 +82,14 @@ def load_settings() -> dict:
         "leave_channel": None,
         "leave_message": "👋 **{name}** has left the server. We now have {count} members.",
         "leave_enabled": False,
-        # Alert config
         "alert_channel": None,
         "alert_role": None,
         "alert_last_tag": None,
-        # Keyword auto-replies  { "keyword": "reply message", ... }
         "keywords": {},
-        # Sticky messages  { "channel_id": { "message": "...", "last_msg_id": None } }
-        "sticky": {}
+        "sticky": {},
+        # Mod application ticket settings
+        "modapp_apply_channel": None,   # channel where users see the apply button
+        "modapp_log_channel": None,     # private channel where mods read apps
     }
 
 def save_settings(data: dict):
@@ -98,20 +98,35 @@ def save_settings(data: dict):
 
 settings = load_settings()
 
-# Ensure new keys exist in old settings files
 for _key, _default in [
     ("alert_channel", None),
     ("alert_role", None),
     ("alert_last_tag", None),
     ("keywords", {}),
     ("sticky", {}),
+    ("modapp_apply_channel", None),
+    ("modapp_log_channel", None),
 ]:
     if _key not in settings:
         settings[_key] = _default
 save_settings(settings)
 
-# Per-user MP3 job tracking — prevents spam/duplicate requests
+# Per-user MP3 job tracking
 _active_mp3: set = set()
+
+# Track ongoing mod applications: user_id -> step index + answers
+_active_applications: dict = {}
+
+MOD_APP_QUESTIONS = [
+    "👋 **Question 1/5 — Why do you want to become a moderator?**",
+    "⭐ **Question 2/5 — Why should we pick you over anyone else?**",
+    "🛡️ **Question 3/5 — How would you handle a situation where two members are arguing in chat?**",
+    "🕐 **Question 4/5 — How many hours per day/week can you dedicate to moderating?**",
+    "🎂 **Question 5/5 — How old are you?** *(You must be 13 or older to apply.)*",
+]
+
+MIN_ACCOUNT_AGE_DAYS = 5
+MIN_AGE = 13
 
 # ════════════════════════════════════════════════
 #                BOT SETUP
@@ -156,6 +171,196 @@ def in_download_channel():
     return commands.check(predicate)
 
 # ════════════════════════════════════════════════
+#   MOD APPLICATION — BUTTON VIEWS
+# ════════════════════════════════════════════════
+
+class ApplyButtonView(discord.ui.View):
+    """The persistent 'Create Ticket' button shown in the apply channel."""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="📋 Create Ticket",
+        style=discord.ButtonStyle.green,
+        custom_id="modapp_create_ticket"
+    )
+    async def create_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        user = interaction.user
+        guild = interaction.guild
+
+        # ── Account age check ──────────────────────────
+        account_age = (datetime.datetime.now(datetime.timezone.utc) - user.created_at).days
+        if account_age < MIN_ACCOUNT_AGE_DAYS:
+            await interaction.response.send_message(
+                f"❌ **Your request has been denied.**\n"
+                f"Your account must be at least **{MIN_ACCOUNT_AGE_DAYS} days old** to apply.\n"
+                f"Your account is only **{account_age} day(s) old**.",
+                ephemeral=True
+            )
+            return
+
+        # ── Already in progress ────────────────────────
+        if user.id in _active_applications:
+            await interaction.response.send_message(
+                "⚠️ You already have an application in progress! Please check your DMs.",
+                ephemeral=True
+            )
+            return
+
+        # ── Try to DM the user ─────────────────────────
+        try:
+            dm = await user.create_dm()
+            intro_embed = discord.Embed(
+                title="📋 Moderator Application",
+                description=(
+                    "Welcome to the **Moderator Application**!\n\n"
+                    "I'll ask you **5 questions** one at a time.\n"
+                    "Please answer each one thoroughly.\n\n"
+                    "**Requirements:**\n"
+                    "• You must be **13 years or older**\n"
+                    "• Your account must be at least **5 days old** ✅\n\n"
+                    "When you're done, type your answer and I'll move to the next question.\n"
+                    "Type `cancel` at any time to cancel your application.\n\n"
+                    "Let's begin! 🚀"
+                ),
+                color=discord.Color.blurple()
+            )
+            intro_embed.set_footer(text=f"Server: {guild.name}")
+            await dm.send(embed=intro_embed)
+
+            # Send first question
+            q_embed = discord.Embed(
+                description=MOD_APP_QUESTIONS[0],
+                color=discord.Color.blue()
+            )
+            q_embed.set_footer(text="Question 1 of 5 • Type your answer below")
+            await dm.send(embed=q_embed)
+
+            _active_applications[user.id] = {
+                "step": 0,
+                "answers": [],
+                "guild_id": guild.id,
+                "dm_channel_id": dm.id,
+                "username": str(user),
+                "user_id": user.id,
+            }
+
+            await interaction.response.send_message(
+                "✅ **Application started!** Check your DMs to continue.",
+                ephemeral=True
+            )
+
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "❌ I couldn't DM you. Please **enable DMs from server members** in your Privacy Settings and try again.",
+                ephemeral=True
+            )
+
+
+class DoneButtonView(discord.ui.View):
+    """'I'm Done' button sent after all questions are answered."""
+    def __init__(self, user_id: int):
+        super().__init__(timeout=600)
+        self.user_id = user_id
+
+    @discord.ui.button(label="✅ I'm Done — Submit Application", style=discord.ButtonStyle.green)
+    async def done(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your application!", ephemeral=True)
+            return
+
+        app = _active_applications.get(self.user_id)
+        if not app:
+            await interaction.response.send_message("❌ No active application found.", ephemeral=True)
+            return
+
+        await interaction.response.send_message(
+            "📤 **Submitting your application...** Thank you for applying!",
+            ephemeral=False
+        )
+
+        await submit_application(self.user_id, app)
+        self.stop()
+
+    @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.red)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your application!", ephemeral=True)
+            return
+        _active_applications.pop(self.user_id, None)
+        await interaction.response.send_message("❌ Application cancelled.", ephemeral=False)
+        self.stop()
+
+
+async def submit_application(user_id: int, app: dict):
+    """Send the completed application to the mod log channel."""
+    log_channel_id = settings.get("modapp_log_channel")
+    if not log_channel_id:
+        return
+
+    guild = bot.get_guild(app["guild_id"])
+    if not guild:
+        return
+
+    log_channel = guild.get_channel(int(log_channel_id))
+    if not log_channel:
+        return
+
+    answers = app.get("answers", [])
+    username = app.get("username", "Unknown")
+    user_id_val = app.get("user_id", user_id)
+
+    embed = discord.Embed(
+        title="📋 New Moderator Application",
+        color=discord.Color.green(),
+        timestamp=datetime.datetime.utcnow()
+    )
+    embed.set_author(name=username, icon_url=None)
+    embed.add_field(name="Applicant", value=f"<@{user_id_val}> (`{username}`)", inline=True)
+    embed.add_field(name="User ID", value=str(user_id_val), inline=True)
+
+    question_labels = [
+        "Why do you want to become a moderator?",
+        "Why should we pick you over anyone else?",
+        "How would you handle two members arguing?",
+        "How many hours can you dedicate?",
+        "How old are you?",
+    ]
+
+    for i, (label, answer) in enumerate(zip(question_labels, answers)):
+        embed.add_field(
+            name=f"Q{i+1}: {label}",
+            value=answer[:1024] if answer else "*No answer*",
+            inline=False
+        )
+
+    embed.set_footer(text="Review this application and decide accordingly.")
+
+    await log_channel.send(
+        content="📬 **A new moderator application has been submitted!**",
+        embed=embed
+    )
+
+    # Notify applicant
+    try:
+        user = await bot.fetch_user(user_id_val)
+        dm = await user.create_dm()
+        confirm_embed = discord.Embed(
+            title="✅ Application Submitted!",
+            description=(
+                "Your moderator application has been **successfully submitted**!\n\n"
+                "Our team will review it and get back to you.\n"
+                "Thank you for your interest in helping moderate the server! 🙏"
+            ),
+            color=discord.Color.green()
+        )
+        await dm.send(embed=confirm_embed)
+    except Exception:
+        pass
+
+    _active_applications.pop(user_id, None)
+
+# ════════════════════════════════════════════════
 #                   EVENTS
 # ════════════════════════════════════════════════
 
@@ -171,6 +376,8 @@ async def on_ready():
         type=discord.ActivityType.listening,
         name=f"{settings['prefix']}help"
     ))
+    # Re-register persistent views so buttons work after restart
+    bot.add_view(ApplyButtonView())
     check_github_release.start()
 
 @bot.event
@@ -192,13 +399,21 @@ async def on_message(message):
     if message.author.bot:
         return
 
+    # ── DM handler for mod applications ──────────
+    if isinstance(message.channel, discord.DMChannel):
+        uid = message.author.id
+        app = _active_applications.get(uid)
+        if app is not None:
+            await handle_application_dm(message, app)
+            return  # Don't process commands from DMs during application
+
     # ── Keyword auto-reply ───────────────────────
     if message.guild and message.guild.id == GUILD_ID:
         content_lower = message.content.lower()
         for keyword, reply in settings.get("keywords", {}).items():
             if keyword.lower() in content_lower:
                 await message.reply(reply)
-                break  # only one reply per message
+                break
 
     await bot.process_commands(message)
 
@@ -207,7 +422,6 @@ async def on_message(message):
         ch_id = str(message.channel.id)
         sticky_data = settings.get("sticky", {}).get(ch_id)
         if sticky_data and not message.author.bot:
-            # Delete old sticky if we have its ID
             old_id = sticky_data.get("last_msg_id")
             if old_id:
                 try:
@@ -215,10 +429,125 @@ async def on_message(message):
                     await old_msg.delete()
                 except Exception:
                     pass
-            # Post new sticky
             new_msg = await message.channel.send(sticky_data["message"])
             settings["sticky"][ch_id]["last_msg_id"] = new_msg.id
             save_settings(settings)
+
+
+async def handle_application_dm(message: discord.Message, app: dict):
+    """Process a DM answer during a mod application."""
+    uid = message.author.id
+    content = message.content.strip()
+
+    if content.lower() == "cancel":
+        _active_applications.pop(uid, None)
+        await message.channel.send("❌ Your application has been cancelled.")
+        return
+
+    step = app["step"]
+    answer = content
+
+    # ── Age validation on last question ───────────
+    if step == len(MOD_APP_QUESTIONS) - 1:
+        try:
+            age = int(''.join(filter(str.isdigit, answer)))
+            if age < MIN_AGE:
+                _active_applications.pop(uid, None)
+                await message.channel.send(
+                    f"❌ **Your application has been denied.**\n"
+                    f"You must be **{MIN_AGE} years or older** to apply for moderator.\n"
+                    f"Thank you for your interest!"
+                )
+                return
+        except (ValueError, TypeError):
+            await message.channel.send(
+                "⚠️ Please enter your age as a number (e.g. `16`)."
+            )
+            return
+
+    app["answers"].append(answer)
+    app["step"] += 1
+
+    # ── More questions remaining ───────────────────
+    if app["step"] < len(MOD_APP_QUESTIONS):
+        q_embed = discord.Embed(
+            description=MOD_APP_QUESTIONS[app["step"]],
+            color=discord.Color.blue()
+        )
+        q_embed.set_footer(text=f"Question {app['step'] + 1} of {len(MOD_APP_QUESTIONS)} • Type your answer below")
+        await message.channel.send(embed=q_embed)
+
+    # ── All questions answered — show Done button ──
+    else:
+        summary_embed = discord.Embed(
+            title="✅ All Questions Answered!",
+            description=(
+                "You've answered all the questions.\n\n"
+                "**Please review your answers:**"
+            ),
+            color=discord.Color.gold()
+        )
+        q_labels = [
+            "Why mod?",
+            "Why you over others?",
+            "Handling conflicts?",
+            "Hours available?",
+            "Your age?",
+        ]
+        for i, (label, ans) in enumerate(zip(q_labels, app["answers"])):
+            summary_embed.add_field(name=f"Q{i+1}: {label}", value=ans[:512], inline=False)
+        summary_embed.set_footer(text="Click 'I'm Done' to submit or 'Cancel' to discard.")
+
+        view = DoneButtonView(uid)
+        await message.channel.send(embed=summary_embed, view=view)
+
+
+# ════════════════════════════════════════════════
+#   MOD APPLICATION SETUP COMMAND
+# ════════════════════════════════════════════════
+
+@bot.command(name="embed")
+@in_guild()
+@is_admin_or_owner()
+async def modapp_embed(ctx, apply_channel: discord.TextChannel, log_channel: discord.TextChannel):
+    """[ADMIN] Set up the mod application system.
+    Usage: .embed #apply-channel #mod-apps-log
+
+    apply_channel  — Where users click the 'Create Ticket' button.
+    log_channel    — Private channel where completed applications are posted."""
+
+    settings["modapp_apply_channel"] = apply_channel.id
+    settings["modapp_log_channel"]   = log_channel.id
+    save_settings(settings)
+
+    embed = discord.Embed(
+        title="🛡️ Moderator Applications",
+        description=(
+            "Want to help keep the server safe and welcoming?\n\n"
+            "**Click the button below to apply for Moderator!**\n\n"
+            "**Requirements:**\n"
+            "• Must be **13 years or older**\n"
+            "• Discord account must be at least **5 days old**\n"
+            "• Have DMs open from server members\n\n"
+            "After clicking, the bot will DM you a short form with **5 questions**.\n"
+            "Answer honestly — good luck! 🍀"
+        ),
+        color=discord.Color.blurple()
+    )
+    embed.set_footer(text="Moderator Application System • Click below to begin")
+
+    view = ApplyButtonView()
+    await apply_channel.send(embed=embed, view=view)
+
+    await ctx.send(
+        f"✅ **Mod application embed sent to {apply_channel.mention}!**\n"
+        f"📬 Completed applications will be posted in {log_channel.mention}.",
+        delete_after=10
+    )
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
 
 # ════════════════════════════════════════════════
 #         WELCOME & LEAVE EVENTS
@@ -279,7 +608,6 @@ async def on_member_remove(member: discord.Member):
 @in_guild()
 @is_admin_or_owner()
 async def setwelcome(ctx, channel: discord.TextChannel, *, message: str = None):
-    """[ADMIN] Set the welcome channel and optional message."""
     settings["welcome_channel"] = channel.id
     settings["welcome_enabled"] = True
     if message:
@@ -296,7 +624,6 @@ async def setwelcome(ctx, channel: discord.TextChannel, *, message: str = None):
 @in_guild()
 @is_admin_or_owner()
 async def setleave(ctx, channel: discord.TextChannel, *, message: str = None):
-    """[ADMIN] Set the leave channel and optional message."""
     settings["leave_channel"] = channel.id
     settings["leave_enabled"] = True
     if message:
@@ -313,7 +640,6 @@ async def setleave(ctx, channel: discord.TextChannel, *, message: str = None):
 @in_guild()
 @is_admin_or_owner()
 async def setwelcomemsg(ctx, *, message: str):
-    """[ADMIN] Change the welcome message text only."""
     settings["welcome_message"] = message
     save_settings(settings)
     await ctx.send(f"✅ Welcome message updated:\n> {message}\n\nVariables: `{{mention}}` `{{name}}` `{{tag}}` `{{count}}` `{{server}}`")
@@ -322,7 +648,6 @@ async def setwelcomemsg(ctx, *, message: str):
 @in_guild()
 @is_admin_or_owner()
 async def setleavemsg(ctx, *, message: str):
-    """[ADMIN] Change the leave message text only."""
     settings["leave_message"] = message
     save_settings(settings)
     await ctx.send(f"✅ Leave message updated:\n> {message}\n\nVariables: `{{mention}}` `{{name}}` `{{tag}}` `{{count}}` `{{server}}`")
@@ -331,7 +656,6 @@ async def setleavemsg(ctx, *, message: str):
 @in_guild()
 @is_admin_or_owner()
 async def togglewelcome(ctx):
-    """[ADMIN] Toggle welcome messages on or off."""
     settings["welcome_enabled"] = not settings.get("welcome_enabled", False)
     save_settings(settings)
     state = "✅ **Enabled**" if settings["welcome_enabled"] else "❌ **Disabled**"
@@ -341,7 +665,6 @@ async def togglewelcome(ctx):
 @in_guild()
 @is_admin_or_owner()
 async def toggleleave(ctx):
-    """[ADMIN] Toggle leave messages on or off."""
     settings["leave_enabled"] = not settings.get("leave_enabled", False)
     save_settings(settings)
     state = "✅ **Enabled**" if settings["leave_enabled"] else "❌ **Disabled**"
@@ -351,14 +674,13 @@ async def toggleleave(ctx):
 @in_guild()
 @is_admin_or_owner()
 async def welcometest(ctx):
-    """[ADMIN] Test the welcome message using your own account."""
     channel_id = settings.get("welcome_channel")
     if not channel_id:
         await ctx.send("❌ No welcome channel set. Use `.setwelcome #channel` first.")
         return
     channel = ctx.guild.get_channel(int(channel_id))
     if not channel:
-        await ctx.send("❌ Welcome channel not found. Set it again with `.setwelcome`.")
+        await ctx.send("❌ Welcome channel not found.")
         return
     msg = _format_msg(settings.get("welcome_message", "👋 Welcome {mention}!"), ctx.author)
     embed = discord.Embed(
@@ -377,14 +699,13 @@ async def welcometest(ctx):
 @in_guild()
 @is_admin_or_owner()
 async def leavetest(ctx):
-    """[ADMIN] Test the leave message using your own account."""
     channel_id = settings.get("leave_channel")
     if not channel_id:
         await ctx.send("❌ No leave channel set. Use `.setleave #channel` first.")
         return
     channel = ctx.guild.get_channel(int(channel_id))
     if not channel:
-        await ctx.send("❌ Leave channel not found. Set it again with `.setleave`.")
+        await ctx.send("❌ Leave channel not found.")
         return
     msg = _format_msg(settings.get("leave_message", "👋 **{name}** left the server."), ctx.author)
     embed = discord.Embed(title="👋 Member Left", description=msg, color=discord.Color.red())
@@ -398,7 +719,6 @@ async def leavetest(ctx):
 @in_guild()
 @is_admin_or_owner()
 async def welcomestatus(ctx):
-    """[ADMIN] View current welcome & leave configuration."""
     wc_id = settings.get("welcome_channel")
     lc_id = settings.get("leave_channel")
     wc = ctx.guild.get_channel(int(wc_id)).mention if wc_id else "Not set"
@@ -424,7 +744,6 @@ async def welcomestatus(ctx):
 @is_owner()
 @in_download_channel()
 async def setfile(ctx, *, custom_message: str = None):
-    """[OWNER] Attach a file to set it as the installer."""
     if not ctx.message.attachments:
         await ctx.send(
             "❌ Please **attach a file** when using `.setfile`.\n"
@@ -454,7 +773,6 @@ async def setfile(ctx, *, custom_message: str = None):
 @in_guild()
 @in_download_channel()
 async def download_file(ctx):
-    """Get the installer file. Only works in the designated channel."""
     file_path = settings.get("installer_file")
     if not file_path or not os.path.exists(file_path):
         await ctx.reply(
@@ -475,7 +793,6 @@ async def download_file(ctx):
 @in_guild()
 @in_download_channel()
 async def mp3(ctx, *, url: str = None):
-    """Convert a YouTube video to MP3. Only works in the designated channel."""
     if not url:
         await ctx.send(f"⚠️ Usage: `{settings['prefix']}mp3 <youtube_url>`")
         return
@@ -570,19 +887,16 @@ async def mp3(ctx, *, url: str = None):
         _active_mp3.discard(ctx.author.id)
 
 # ════════════════════════════════════════════════
-#   GITHUB RELEASE ALERT  (.setalert + task loop)
+#   GITHUB RELEASE ALERT
 # ════════════════════════════════════════════════
 
 @bot.command(name="setalert")
 @in_guild()
 @is_admin_or_owner()
 async def setalert(ctx, channel: discord.TextChannel, role: discord.Role):
-    """[ADMIN] Set the channel and role to ping for GitHub release alerts.
-    Usage: .setalert #channel @role"""
     settings["alert_channel"] = channel.id
     settings["alert_role"]    = role.id
     save_settings(settings)
-
     embed = discord.Embed(title="✅ Release Alert Configured", color=discord.Color.blurple())
     embed.add_field(name="Channel", value=channel.mention, inline=True)
     embed.add_field(name="Role",    value=role.mention,    inline=True)
@@ -596,13 +910,10 @@ async def setalert(ctx, channel: discord.TextChannel, role: discord.Role):
 
 @tasks.loop(minutes=5)
 async def check_github_release():
-    """Background task: poll GitHub every 5 minutes for a new release tag."""
     alert_channel_id = settings.get("alert_channel")
     alert_role_id    = settings.get("alert_role")
-
     if not alert_channel_id or not alert_role_id:
-        return  # Not configured yet
-
+        return
     try:
         async with aiohttp.ClientSession() as session:
             headers = {"Accept": "application/vnd.github+json"}
@@ -610,31 +921,23 @@ async def check_github_release():
                 if resp.status != 200:
                     return
                 data = await resp.json()
-
         tag = data.get("tag_name")
         if not tag:
             return
-
         last_tag = settings.get("alert_last_tag")
         if tag == last_tag:
-            return  # No new release
-
-        # New release detected!
+            return
         settings["alert_last_tag"] = tag
         save_settings(settings)
-
         guild = bot.get_guild(GUILD_ID)
         if not guild:
             return
-
         channel = guild.get_channel(int(alert_channel_id))
         role    = guild.get_role(int(alert_role_id))
         if not channel or not role:
             return
-
         release_url  = data.get("html_url", "https://github.com/evanblokender/iis-stupid-menu-revive/releases")
         release_body = data.get("body", "").strip()[:400] or "No release notes provided."
-
         embed = discord.Embed(
             title=f"🆕 Menu updated to version {tag}",
             url=release_url,
@@ -643,15 +946,9 @@ async def check_github_release():
             timestamp=datetime.datetime.utcnow()
         )
         embed.add_field(name="Version", value=f"`{tag}`", inline=True)
-        embed.add_field(
-            name="Download",
-            value=f"[GitHub Releases]({release_url})",
-            inline=True
-        )
+        embed.add_field(name="Download", value=f"[GitHub Releases]({release_url})", inline=True)
         embed.set_footer(text="Run the patcher to update it!")
-
         await channel.send(content=f"{role.mention}", embed=embed)
-
     except Exception as e:
         print(f"[ALERT] GitHub check error: {e}")
 
@@ -660,16 +957,13 @@ async def before_check():
     await bot.wait_until_ready()
 
 # ════════════════════════════════════════════════
-#   KEYWORD AUTO-REPLY  (.addkeyword / .removekeyword / .listkeywords)
+#   KEYWORD AUTO-REPLY
 # ════════════════════════════════════════════════
 
 @bot.command(name="addkeyword")
 @in_guild()
 @is_admin_or_owner()
 async def addkeyword(ctx, keyword: str, *, reply: str):
-    """[ADMIN] Add a keyword auto-reply.
-    Usage: .addkeyword <keyword> <reply message>
-    Example: .addkeyword discord Check out our Discord rules!"""
     keywords = settings.get("keywords", {})
     keywords[keyword.lower()] = reply
     settings["keywords"] = keywords
@@ -684,8 +978,6 @@ async def addkeyword(ctx, keyword: str, *, reply: str):
 @in_guild()
 @is_admin_or_owner()
 async def removekeyword(ctx, keyword: str):
-    """[ADMIN] Remove a keyword auto-reply.
-    Usage: .removekeyword <keyword>"""
     keywords = settings.get("keywords", {})
     key = keyword.lower()
     if key not in keywords:
@@ -700,7 +992,6 @@ async def removekeyword(ctx, keyword: str):
 @in_guild()
 @is_admin_or_owner()
 async def listkeywords(ctx):
-    """[ADMIN] List all keyword auto-replies."""
     keywords = settings.get("keywords", {})
     if not keywords:
         await ctx.send("ℹ️ No keywords set. Use `.addkeyword <word> <reply>` to add one.")
@@ -711,18 +1002,14 @@ async def listkeywords(ctx):
     await ctx.send(embed=embed)
 
 # ════════════════════════════════════════════════
-#   STICKY MESSAGE  (.stick / .unstick)
+#   STICKY MESSAGE
 # ════════════════════════════════════════════════
 
 @bot.command(name="stick")
 @in_guild()
 @is_admin_or_owner()
 async def stick(ctx, channel: discord.TextChannel, *, message: str):
-    """[ADMIN] Stick a message to a channel. It will re-post itself after every new message.
-    Usage: .stick #channel Your sticky message here"""
     ch_id = str(channel.id)
-
-    # Remove any existing sticky first
     existing = settings.get("sticky", {}).get(ch_id)
     if existing and existing.get("last_msg_id"):
         try:
@@ -730,15 +1017,11 @@ async def stick(ctx, channel: discord.TextChannel, *, message: str):
             await old_msg.delete()
         except Exception:
             pass
-
-    # Post the initial sticky
     sent = await channel.send(f"📌 {message}")
-
     sticky = settings.get("sticky", {})
     sticky[ch_id] = {"message": f"📌 {message}", "last_msg_id": sent.id}
     settings["sticky"] = sticky
     save_settings(settings)
-
     embed = discord.Embed(title="📌 Sticky Set", color=discord.Color.gold())
     embed.add_field(name="Channel", value=channel.mention, inline=True)
     embed.add_field(name="Message", value=message[:200],   inline=False)
@@ -749,15 +1032,11 @@ async def stick(ctx, channel: discord.TextChannel, *, message: str):
 @in_guild()
 @is_admin_or_owner()
 async def unstick(ctx, channel: discord.TextChannel):
-    """[ADMIN] Remove the sticky message from a channel.
-    Usage: .unstick #channel"""
     ch_id  = str(channel.id)
     sticky = settings.get("sticky", {})
-
     if ch_id not in sticky:
         await ctx.send(f"ℹ️ No sticky message set in {channel.mention}.", delete_after=8)
         return
-
     last_id = sticky[ch_id].get("last_msg_id")
     if last_id:
         try:
@@ -765,7 +1044,6 @@ async def unstick(ctx, channel: discord.TextChannel):
             await old_msg.delete()
         except Exception:
             pass
-
     del sticky[ch_id]
     settings["sticky"] = sticky
     save_settings(settings)
@@ -779,7 +1057,6 @@ async def unstick(ctx, channel: discord.TextChannel):
 @in_guild()
 @is_admin_or_owner()
 async def purge(ctx, amount: int):
-    """[ADMIN] Delete N messages (max 200)."""
     if not 1 <= amount <= 200:
         await ctx.send("⚠️ Amount must be between 1 and 200.", delete_after=6)
         return
@@ -793,7 +1070,6 @@ async def purge(ctx, amount: int):
 @in_guild()
 @is_admin_or_owner()
 async def kick(ctx, member: discord.Member, *, reason: str = "No reason provided"):
-    """[ADMIN] Kick a member."""
     if member.top_role >= ctx.author.top_role and ctx.author.id != OWNER_ID:
         await ctx.send("❌ You can't kick someone with an equal or higher role.")
         return
@@ -808,7 +1084,6 @@ async def kick(ctx, member: discord.Member, *, reason: str = "No reason provided
 @in_guild()
 @is_admin_or_owner()
 async def ban(ctx, member: discord.Member, *, reason: str = "No reason provided"):
-    """[ADMIN] Ban a member."""
     if member.top_role >= ctx.author.top_role and ctx.author.id != OWNER_ID:
         await ctx.send("❌ You can't ban someone with an equal or higher role.")
         return
@@ -823,7 +1098,6 @@ async def ban(ctx, member: discord.Member, *, reason: str = "No reason provided"
 @in_guild()
 @is_admin_or_owner()
 async def unban(ctx, *, user_input: str):
-    """[ADMIN] Unban by user ID or Name#0000."""
     try:
         uid  = int(user_input)
         user = await bot.fetch_user(uid)
@@ -844,7 +1118,6 @@ async def unban(ctx, *, user_input: str):
 @in_guild()
 @is_admin_or_owner()
 async def mute(ctx, member: discord.Member, minutes: int = 10, *, reason: str = "No reason"):
-    """[ADMIN] Timeout a member. Default 10 minutes."""
     until = discord.utils.utcnow() + datetime.timedelta(minutes=minutes)
     await member.timeout(until, reason=reason)
     embed = discord.Embed(title="🔇 Member Muted", color=discord.Color.greyple())
@@ -857,7 +1130,6 @@ async def mute(ctx, member: discord.Member, minutes: int = 10, *, reason: str = 
 @in_guild()
 @is_admin_or_owner()
 async def unmute(ctx, member: discord.Member):
-    """[ADMIN] Remove timeout."""
     await member.timeout(None)
     await ctx.send(f"🔊 **{member}** has been unmuted.")
 
@@ -865,7 +1137,6 @@ async def unmute(ctx, member: discord.Member):
 @in_guild()
 @is_admin_or_owner()
 async def slowmode(ctx, seconds: int = 0):
-    """[ADMIN] Set slowmode (0 to disable)."""
     await ctx.channel.edit(slowmode_delay=seconds)
     await ctx.send("✅ Slowmode **disabled**." if seconds == 0 else f"✅ Slowmode set to **{seconds}s**.")
 
@@ -873,7 +1144,6 @@ async def slowmode(ctx, seconds: int = 0):
 @in_guild()
 @is_admin_or_owner()
 async def lock(ctx):
-    """[ADMIN] Lock the current channel."""
     ow = ctx.channel.overwrites_for(ctx.guild.default_role)
     ow.send_messages = False
     await ctx.channel.set_permissions(ctx.guild.default_role, overwrite=ow)
@@ -883,7 +1153,6 @@ async def lock(ctx):
 @in_guild()
 @is_admin_or_owner()
 async def unlock(ctx):
-    """[ADMIN] Unlock the current channel."""
     ow = ctx.channel.overwrites_for(ctx.guild.default_role)
     ow.send_messages = True
     await ctx.channel.set_permissions(ctx.guild.default_role, overwrite=ow)
@@ -893,7 +1162,6 @@ async def unlock(ctx):
 @in_guild()
 @is_admin_or_owner()
 async def announce(ctx, channel: discord.TextChannel, *, message: str):
-    """[ADMIN] Send an announcement embed to a channel."""
     embed = discord.Embed(description=message, color=discord.Color.gold())
     embed.set_footer(text=f"Announcement by {ctx.author}", icon_url=ctx.author.display_avatar.url)
     await channel.send(embed=embed)
@@ -905,7 +1173,6 @@ async def announce(ctx, channel: discord.TextChannel, *, message: str):
 @in_guild()
 @is_admin_or_owner()
 async def warn(ctx, member: discord.Member, *, reason: str = "No reason provided"):
-    """[ADMIN] Send a warning DM to a member."""
     embed = discord.Embed(
         title="⚠️ You have been warned",
         description=f"**Server:** {ctx.guild.name}\n**Reason:** {reason}",
@@ -925,7 +1192,6 @@ async def warn(ctx, member: discord.Member, *, reason: str = "No reason provided
 @in_guild()
 @is_owner()
 async def setprefix(ctx, prefix: str):
-    """[OWNER] Change the bot's command prefix."""
     settings["prefix"] = prefix
     save_settings(settings)
     await bot.change_presence(activity=discord.Activity(
@@ -937,7 +1203,6 @@ async def setprefix(ctx, prefix: str):
 @in_guild()
 @is_owner()
 async def sethidden(ctx, value: str):
-    """[OWNER] Toggle admin commands in .help (true/false)."""
     if value.lower() in ("true", "yes", "1", "on"):
         settings["hidden"] = True
         save_settings(settings)
@@ -953,7 +1218,6 @@ async def sethidden(ctx, value: str):
 @in_guild()
 @is_owner()
 async def setinstallermsg(ctx, *, message: str):
-    """[OWNER] Change the message sent with .download replies."""
     settings["installer_message"] = message
     save_settings(settings)
     await ctx.send(f"✅ Installer reply message updated:\n> {message}")
@@ -1042,6 +1306,15 @@ async def help_cmd(ctx):
     )
 
     if not hidden:
+        embed.add_field(
+            name="🛡️ Mod Applications",
+            value=(
+                f"`{p}embed #apply-channel #log-channel` — Set up the mod application embed\n"
+                f"Users click **Create Ticket**, get DM'd 5 questions, then submit.\n"
+                f"Requirements: 13+ years old, account 5+ days old, DMs open."
+            ),
+            inline=False
+        )
         embed.add_field(
             name="👋 Welcome & Leave",
             value=(
