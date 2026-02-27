@@ -1,5 +1,5 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 import aiohttp
 import os
 import json
@@ -33,6 +33,8 @@ SETTINGS_FILE    = "settings.json"
 YT_SERVICE_URL   = os.getenv("YT_SERVICE_URL", "")
 DOWNLOADS_DIR    = "downloads"
 PORT             = int(os.getenv("PORT", 8080))
+
+GITHUB_RELEASE_URL = "https://api.github.com/repos/evanblokender/iis-stupid-menu-revive/releases/latest"
 
 Path(DOWNLOADS_DIR).mkdir(exist_ok=True)
 
@@ -79,7 +81,15 @@ def load_settings() -> dict:
         "welcome_enabled": False,
         "leave_channel": None,
         "leave_message": "👋 **{name}** has left the server. We now have {count} members.",
-        "leave_enabled": False
+        "leave_enabled": False,
+        # Alert config
+        "alert_channel": None,
+        "alert_role": None,
+        "alert_last_tag": None,
+        # Keyword auto-replies  { "keyword": "reply message", ... }
+        "keywords": {},
+        # Sticky messages  { "channel_id": { "message": "...", "last_msg_id": None } }
+        "sticky": {}
     }
 
 def save_settings(data: dict):
@@ -87,6 +97,18 @@ def save_settings(data: dict):
         json.dump(data, f, indent=2)
 
 settings = load_settings()
+
+# Ensure new keys exist in old settings files
+for _key, _default in [
+    ("alert_channel", None),
+    ("alert_role", None),
+    ("alert_last_tag", None),
+    ("keywords", {}),
+    ("sticky", {}),
+]:
+    if _key not in settings:
+        settings[_key] = _default
+save_settings(settings)
 
 # Per-user MP3 job tracking — prevents spam/duplicate requests
 _active_mp3: set = set()
@@ -149,6 +171,7 @@ async def on_ready():
         type=discord.ActivityType.listening,
         name=f"{settings['prefix']}help"
     ))
+    check_github_release.start()
 
 @bot.event
 async def on_command_error(ctx, error):
@@ -168,7 +191,34 @@ async def on_command_error(ctx, error):
 async def on_message(message):
     if message.author.bot:
         return
+
+    # ── Keyword auto-reply ───────────────────────
+    if message.guild and message.guild.id == GUILD_ID:
+        content_lower = message.content.lower()
+        for keyword, reply in settings.get("keywords", {}).items():
+            if keyword.lower() in content_lower:
+                await message.reply(reply)
+                break  # only one reply per message
+
     await bot.process_commands(message)
+
+    # ── Sticky message handler ───────────────────
+    if message.guild and message.guild.id == GUILD_ID:
+        ch_id = str(message.channel.id)
+        sticky_data = settings.get("sticky", {}).get(ch_id)
+        if sticky_data and not message.author.bot:
+            # Delete old sticky if we have its ID
+            old_id = sticky_data.get("last_msg_id")
+            if old_id:
+                try:
+                    old_msg = await message.channel.fetch_message(int(old_id))
+                    await old_msg.delete()
+                except Exception:
+                    pass
+            # Post new sticky
+            new_msg = await message.channel.send(sticky_data["message"])
+            settings["sticky"][ch_id]["last_msg_id"] = new_msg.id
+            save_settings(settings)
 
 # ════════════════════════════════════════════════
 #         WELCOME & LEAVE EVENTS
@@ -434,7 +484,6 @@ async def mp3(ctx, *, url: str = None):
         await ctx.send("❌ `YT_SERVICE_URL` is not set. Ask the bot owner to configure it.")
         return
 
-    # Prevent the same user from queuing multiple jobs
     if ctx.author.id in _active_mp3:
         await ctx.reply("⏳ You already have a conversion in progress. Please wait.", delete_after=8)
         return
@@ -443,7 +492,6 @@ async def mp3(ctx, *, url: str = None):
     status = await ctx.reply("🔍 Looking up video...")
 
     try:
-        # ── Step 1: Get video info ────────────────────
         info_timeout = aiohttp.ClientTimeout(total=60)
         async with aiohttp.ClientSession(timeout=info_timeout) as session:
             async with session.get(f"{YT_SERVICE_URL}/info", params={"url": url}) as resp:
@@ -468,7 +516,6 @@ async def mp3(ctx, *, url: str = None):
 
         await status.edit(content=f"⏳ Converting **{title}** to MP3...")
 
-        # ── Step 2: Download converted MP3 ───────────
         dl_timeout = aiohttp.ClientTimeout(total=180)
         async with aiohttp.ClientSession(timeout=dl_timeout) as session:
             async with session.get(f"{YT_SERVICE_URL}/mp3", params={"url": url}) as resp:
@@ -522,6 +569,209 @@ async def mp3(ctx, *, url: str = None):
             os.remove(out_path)
         _active_mp3.discard(ctx.author.id)
 
+# ════════════════════════════════════════════════
+#   GITHUB RELEASE ALERT  (.setalert + task loop)
+# ════════════════════════════════════════════════
+
+@bot.command(name="setalert")
+@in_guild()
+@is_admin_or_owner()
+async def setalert(ctx, channel: discord.TextChannel, role: discord.Role):
+    """[ADMIN] Set the channel and role to ping for GitHub release alerts.
+    Usage: .setalert #channel @role"""
+    settings["alert_channel"] = channel.id
+    settings["alert_role"]    = role.id
+    save_settings(settings)
+
+    embed = discord.Embed(title="✅ Release Alert Configured", color=discord.Color.blurple())
+    embed.add_field(name="Channel", value=channel.mention, inline=True)
+    embed.add_field(name="Role",    value=role.mention,    inline=True)
+    embed.add_field(
+        name="Repo",
+        value="[iis-stupid-menu-revive](https://github.com/evanblokender/iis-stupid-menu-revive/releases)",
+        inline=False
+    )
+    embed.set_footer(text="Bot checks GitHub every 5 minutes for new releases.")
+    await ctx.send(embed=embed)
+
+@tasks.loop(minutes=5)
+async def check_github_release():
+    """Background task: poll GitHub every 5 minutes for a new release tag."""
+    alert_channel_id = settings.get("alert_channel")
+    alert_role_id    = settings.get("alert_role")
+
+    if not alert_channel_id or not alert_role_id:
+        return  # Not configured yet
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            headers = {"Accept": "application/vnd.github+json"}
+            async with session.get(GITHUB_RELEASE_URL, headers=headers) as resp:
+                if resp.status != 200:
+                    return
+                data = await resp.json()
+
+        tag = data.get("tag_name")
+        if not tag:
+            return
+
+        last_tag = settings.get("alert_last_tag")
+        if tag == last_tag:
+            return  # No new release
+
+        # New release detected!
+        settings["alert_last_tag"] = tag
+        save_settings(settings)
+
+        guild = bot.get_guild(GUILD_ID)
+        if not guild:
+            return
+
+        channel = guild.get_channel(int(alert_channel_id))
+        role    = guild.get_role(int(alert_role_id))
+        if not channel or not role:
+            return
+
+        release_url  = data.get("html_url", "https://github.com/evanblokender/iis-stupid-menu-revive/releases")
+        release_body = data.get("body", "").strip()[:400] or "No release notes provided."
+
+        embed = discord.Embed(
+            title=f"🆕 Menu updated to version {tag}",
+            url=release_url,
+            description=release_body,
+            color=discord.Color.green(),
+            timestamp=datetime.datetime.utcnow()
+        )
+        embed.add_field(name="Version", value=f"`{tag}`", inline=True)
+        embed.add_field(
+            name="Download",
+            value=f"[GitHub Releases]({release_url})",
+            inline=True
+        )
+        embed.set_footer(text="Run the patcher to update it!")
+
+        await channel.send(content=f"{role.mention}", embed=embed)
+
+    except Exception as e:
+        print(f"[ALERT] GitHub check error: {e}")
+
+@check_github_release.before_loop
+async def before_check():
+    await bot.wait_until_ready()
+
+# ════════════════════════════════════════════════
+#   KEYWORD AUTO-REPLY  (.addkeyword / .removekeyword / .listkeywords)
+# ════════════════════════════════════════════════
+
+@bot.command(name="addkeyword")
+@in_guild()
+@is_admin_or_owner()
+async def addkeyword(ctx, keyword: str, *, reply: str):
+    """[ADMIN] Add a keyword auto-reply.
+    Usage: .addkeyword <keyword> <reply message>
+    Example: .addkeyword discord Check out our Discord rules!"""
+    keywords = settings.get("keywords", {})
+    keywords[keyword.lower()] = reply
+    settings["keywords"] = keywords
+    save_settings(settings)
+    embed = discord.Embed(title="✅ Keyword Added", color=discord.Color.green())
+    embed.add_field(name="Keyword", value=f"`{keyword.lower()}`", inline=True)
+    embed.add_field(name="Reply",   value=reply,                  inline=False)
+    embed.set_footer(text="Bot will reply to any message containing this keyword.")
+    await ctx.send(embed=embed)
+
+@bot.command(name="removekeyword")
+@in_guild()
+@is_admin_or_owner()
+async def removekeyword(ctx, keyword: str):
+    """[ADMIN] Remove a keyword auto-reply.
+    Usage: .removekeyword <keyword>"""
+    keywords = settings.get("keywords", {})
+    key = keyword.lower()
+    if key not in keywords:
+        await ctx.send(f"❌ Keyword `{key}` not found.", delete_after=8)
+        return
+    del keywords[key]
+    settings["keywords"] = keywords
+    save_settings(settings)
+    await ctx.send(f"✅ Keyword `{key}` removed.")
+
+@bot.command(name="listkeywords")
+@in_guild()
+@is_admin_or_owner()
+async def listkeywords(ctx):
+    """[ADMIN] List all keyword auto-replies."""
+    keywords = settings.get("keywords", {})
+    if not keywords:
+        await ctx.send("ℹ️ No keywords set. Use `.addkeyword <word> <reply>` to add one.")
+        return
+    embed = discord.Embed(title="📋 Keyword Auto-Replies", color=discord.Color.blurple())
+    for kw, reply in keywords.items():
+        embed.add_field(name=f"`{kw}`", value=reply[:200], inline=False)
+    await ctx.send(embed=embed)
+
+# ════════════════════════════════════════════════
+#   STICKY MESSAGE  (.stick / .unstick)
+# ════════════════════════════════════════════════
+
+@bot.command(name="stick")
+@in_guild()
+@is_admin_or_owner()
+async def stick(ctx, channel: discord.TextChannel, *, message: str):
+    """[ADMIN] Stick a message to a channel. It will re-post itself after every new message.
+    Usage: .stick #channel Your sticky message here"""
+    ch_id = str(channel.id)
+
+    # Remove any existing sticky first
+    existing = settings.get("sticky", {}).get(ch_id)
+    if existing and existing.get("last_msg_id"):
+        try:
+            old_msg = await channel.fetch_message(int(existing["last_msg_id"]))
+            await old_msg.delete()
+        except Exception:
+            pass
+
+    # Post the initial sticky
+    sent = await channel.send(f"📌 {message}")
+
+    sticky = settings.get("sticky", {})
+    sticky[ch_id] = {"message": f"📌 {message}", "last_msg_id": sent.id}
+    settings["sticky"] = sticky
+    save_settings(settings)
+
+    embed = discord.Embed(title="📌 Sticky Set", color=discord.Color.gold())
+    embed.add_field(name="Channel", value=channel.mention, inline=True)
+    embed.add_field(name="Message", value=message[:200],   inline=False)
+    embed.set_footer(text="Use .unstick #channel to remove it.")
+    await ctx.send(embed=embed, delete_after=8)
+
+@bot.command(name="unstick")
+@in_guild()
+@is_admin_or_owner()
+async def unstick(ctx, channel: discord.TextChannel):
+    """[ADMIN] Remove the sticky message from a channel.
+    Usage: .unstick #channel"""
+    ch_id  = str(channel.id)
+    sticky = settings.get("sticky", {})
+
+    if ch_id not in sticky:
+        await ctx.send(f"ℹ️ No sticky message set in {channel.mention}.", delete_after=8)
+        return
+
+    last_id = sticky[ch_id].get("last_msg_id")
+    if last_id:
+        try:
+            old_msg = await channel.fetch_message(int(last_id))
+            await old_msg.delete()
+        except Exception:
+            pass
+
+    del sticky[ch_id]
+    settings["sticky"] = sticky
+    save_settings(settings)
+    await ctx.send(f"✅ Sticky message removed from {channel.mention}.")
+
+# ════════════════════════════════════════════════
 #              ADMIN COMMANDS
 # ════════════════════════════════════════════════
 
@@ -802,6 +1052,31 @@ async def help_cmd(ctx):
                 f"`{p}welcometest` / `{p}leavetest` — Preview messages\n"
                 f"`{p}welcomestatus` — View current config\n"
                 f"Variables: `{{mention}}` `{{name}}` `{{count}}` `{{server}}`"
+            ),
+            inline=False
+        )
+        embed.add_field(
+            name="🔔 Release Alerts",
+            value=(
+                f"`{p}setalert #channel @role` — Set GitHub release alert channel & role\n"
+                f"Checks every 5 minutes for new releases automatically."
+            ),
+            inline=False
+        )
+        embed.add_field(
+            name="💬 Keyword Auto-Replies",
+            value=(
+                f"`{p}addkeyword <word> <reply>` — Add a keyword trigger\n"
+                f"`{p}removekeyword <word>` — Remove a keyword\n"
+                f"`{p}listkeywords` — List all keywords"
+            ),
+            inline=False
+        )
+        embed.add_field(
+            name="📌 Sticky Messages",
+            value=(
+                f"`{p}stick #channel <message>` — Stick a message to a channel\n"
+                f"`{p}unstick #channel` — Remove the sticky message"
             ),
             inline=False
         )
